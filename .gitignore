@@ -1,2 +1,6 @@
 /zigc
 /std
+/.build/
+/dist/
+/.zig-cache/
+__pycache__/

@@ -1,0 +1,28 @@
+name: Zig 0.17.0 WASI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Build the pinned WASI compiler
+        run: python3 scripts/build.py --jobs 2
+      - name: Compile and execute programs with the WASI compiler
+        run: node tests/smoke.mjs dist/0.17.0/zig.wasm dist/0.17.0/lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zigc-wasm-0.17.0
+          path: dist/0.17.0/
+          if-no-files-found: error
