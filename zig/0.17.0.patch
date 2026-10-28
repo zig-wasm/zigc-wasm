@@ -1,0 +1,229 @@
+diff --git a/lib/std/Io/Threaded.zig b/lib/std/Io/Threaded.zig
+index 2c7cdbc..21ef764 100644
+--- a/lib/std/Io/Threaded.zig
++++ b/lib/std/Io/Threaded.zig
+@@ -9776,13 +9776,25 @@ fn dirOpenDirWasi(
+         base.PATH_UNLINK_FILE = true;
+     }
+ 
++    // A directory's own rights do not include file read/write/seek rights.
++    // Preserve the parent's inheritable rights so files in this directory
++    // can be opened without requesting capabilities the parent does not have.
++    const inheriting: wasi.rights_t = if (options.access_sub_paths) rights: {
++        var parent_stat: wasi.fdstat_t = undefined;
++        switch (wasi.fd_fdstat_get(dir.handle, &parent_stat)) {
++            .SUCCESS => break :rights parent_stat.fs_rights_inheriting,
++            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
++            else => |err| return posix.unexpectedErrno(err),
++        }
++    } else .{};
++
+     const lookup_flags: wasi.lookupflags_t = .{ .SYMLINK_FOLLOW = options.follow_symlinks };
+     const oflags: wasi.oflags_t = .{ .DIRECTORY = true };
+     const fdflags: wasi.fdflags_t = .{};
+     var fd: posix.fd_t = undefined;
+     const syscall: Syscall = try .start();
+     while (true) {
+-        switch (wasi.path_open(dir.handle, lookup_flags, sub_path.ptr, sub_path.len, oflags, base, base, fdflags, &fd)) {
++        switch (wasi.path_open(dir.handle, lookup_flags, sub_path.ptr, sub_path.len, oflags, base, inheriting, fdflags, &fd)) {
+             .SUCCESS => {
+                 syscall.finish();
+                 return .{ .handle = fd };
+diff --git a/src/Compilation.zig b/src/Compilation.zig
+index 309ed5d..93c4a46 100644
+--- a/src/Compilation.zig
++++ b/src/Compilation.zig
+@@ -1794,6 +1794,9 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
+                 if (output_mode == .Obj) break :s .zcu;
+             }
+             if (need_llvm and !build_options.have_llvm) break :s .none; // impossible to build without llvm
++            // The self-hosted Wasm linker cannot emit static archives. Use a
++            // relocatable runtime object, including when linking only objects.
++            if (dev.env == .wasm_wasi) break :s .obj;
+             if (is_exe_or_dyn_lib) break :s .lib;
+             break :s .obj;
+         };
+diff --git a/src/dev.zig b/src/dev.zig
+index 6472f65..ae01015 100644
+--- a/src/dev.zig
++++ b/src/dev.zig
+@@ -48,6 +48,10 @@ pub const Env = enum {
+     /// - `zig build-* -fno-llvm -fno-lld -target wasm32-* --listen=-`
+     wasm,
+ 
++    /// WASI-hosted compiler with the self-hosted WebAssembly backend.
++    /// Excludes subprocesses, native linkers, LLVM, and compiler servers.
++    wasm_wasi,
++
+     /// - sema
+     /// - `zig build-* -fincremental -fno-llvm -fno-lld -target x86_64-linux --listen=-`
+     @"x86_64-linux",
+@@ -216,6 +220,23 @@ pub const Env = enum {
+                 => true,
+                 else => Env.sema.supports(feature),
+             },
++            .wasm_wasi => switch (feature) {
++                .build_exe_command,
++                .build_obj_command,
++                .ast_check_command,
++                .fmt_command,
++                .targets_command,
++                .version_command,
++                .env_command,
++                .help_command,
++                .ast_gen,
++                .sema,
++                .legalize,
++                .wasm_backend,
++                .wasm_linker,
++                => true,
++                else => false,
++            },
+             .@"x86_64-linux" => switch (feature) {
+                 .stdio_listen,
+                 .incremental,
+@@ -335,7 +356,7 @@ pub const Feature = enum {
+ /// Makes the code following the call to this function unreachable if `feature` is disabled.
+ pub fn check(comptime feature: Feature) if (env.supports(feature)) void else noreturn {
+     if (env.supports(feature)) return;
+-    @panic("development environment " ++ @tagName(env) ++ " does not support feature " ++ @tagName(feature));
++    unsupported("development environment " ++ @tagName(env) ++ " does not support feature " ++ @tagName(feature));
+ }
+ 
+ /// Makes the code following the call to this function unreachable if all of `features` are disabled.
+@@ -344,14 +365,19 @@ pub fn checkAny(comptime features: []const Feature) if (env.supportsAny(features
+     comptime var feature_tags: []const u8 = "";
+     inline for (features[0 .. features.len - 1]) |feature| feature_tags = feature_tags ++ @tagName(feature) ++ ", ";
+     feature_tags = feature_tags ++ "or " ++ @tagName(features[features.len - 1]);
+-    @panic("development environment " ++ @tagName(env) ++ " does not support feature " ++ feature_tags);
++    unsupported("development environment " ++ @tagName(env) ++ " does not support feature " ++ feature_tags);
+ }
+ 
+ /// Makes the code following the call to this function unreachable if any of `features` are disabled.
+ pub fn checkAll(comptime features: []const Feature) if (env.supportsAll(features)) void else noreturn {
+     if (env.supportsAll(features)) return;
+     inline for (features) |feature| if (!env.supports(feature))
+-        @panic("development environment " ++ @tagName(env) ++ " does not support feature " ++ @tagName(feature));
++        unsupported("development environment " ++ @tagName(env) ++ " does not support feature " ++ @tagName(feature));
++}
++
++fn unsupported(comptime message: []const u8) noreturn {
++    if (env == .wasm_wasi) @import("std").process.fatal("{s}", .{message});
++    @panic(message);
+ }
+ 
+ const build_options = @import("build_options");
+diff --git a/src/fmt.zig b/src/fmt.zig
+index 8bb5582..150718c 100644
+--- a/src/fmt.zig
++++ b/src/fmt.zig
+@@ -172,7 +172,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
+     }
+ 
+     var stdout_buffer: [4096]u8 = undefined;
+-    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
++    var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
+ 
+     var fmt: Fmt = .{
+         .gpa = gpa,
+diff --git a/src/link/Wasm/Flush.zig b/src/link/Wasm/Flush.zig
+index 745e302..e1ba76c 100644
+--- a/src/link/Wasm/Flush.zig
++++ b/src/link/Wasm/Flush.zig
+@@ -1720,6 +1720,11 @@ pub fn finish(f: *Flush, wasm: *Wasm) !void {
+         defer debug_bytes.deinit();
+ 
+         try emitProducerSection(gpa, binary_bytes);
++    }
++
++    // The object reader requires target_features even when debug information
++    // is stripped (in particular for the compiler_rt relocatable object).
++    if (is_obj or comp.config.debug_format != .strip) {
+         try emitFeaturesSection(gpa, binary_bytes, target);
+     }
+ 
+@@ -1839,7 +1844,6 @@ fn emitFeaturesSection(
+     target: *const std.Target,
+ ) Allocator.Error!void {
+     const feature_count = target.cpu.features.count();
+-    if (feature_count == 0) return;
+ 
+     const header_offset = try reserveCustomSectionHeader(gpa, binary_bytes);
+     defer writeCustomSectionHeader(binary_bytes, header_offset);
+diff --git a/src/main.zig b/src/main.zig
+index 7d9d7e8..e6290d8 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -125,7 +125,25 @@ const debug_usage = normal_usage ++
+     \\
+ ;
+ 
+-const usage = if (build_options.enable_debug_extensions) debug_usage else normal_usage;
++const wasi_usage =
++    \\Usage: zig [command] [options]
++    \\
++    \\WASI compiler commands:
++    \\  build-exe        Create a WebAssembly executable
++    \\  build-obj        Create a WebAssembly object
++    \\  ast-check        Check source syntax
++    \\  fmt              Format Zig source
++    \\  targets          List Zig's target database (only Wasm backend included)
++    \\  version          Print version number
++    \\  env              Print compiler environment
++    \\  help             Print this help
++    \\
++    \\Compilation requires a Wasm target and -fno-llvm -fno-lld.
++    \\Preopen '.', '/lib', and '/cache', with '.' first (fd 3).
++    \\
++;
++
++const usage = if (dev.env == .wasm_wasi) wasi_usage else if (build_options.enable_debug_extensions) debug_usage else normal_usage;
+ 
+ var log_scopes: std.ArrayList([]const u8) = .empty;
+ 
+@@ -317,10 +335,25 @@ fn mainArgs(
+ 
+     const cmd = args[1];
+     const cmd_args = args[2..];
+-    switch (stringToEnum(Cmd, cmd) orelse {
++    const command = stringToEnum(Cmd, cmd) orelse {
+         std.log.info("{s}", .{usage});
+         fatal("unknown command: {s}", .{args[1]});
+-    }) {
++    };
++    if (dev.env == .wasm_wasi) switch (command) {
++        .@"build-exe",
++        .@"build-obj",
++        .@"ast-check",
++        .fmt,
++        .targets,
++        .version,
++        .env,
++        .help,
++        .@"-h",
++        .@"--help",
++        => {},
++        else => fatal("command '{s}' is unavailable in the WASI compiler", .{cmd}),
++    };
++    switch (command) {
+         .@"build-exe" => {
+             dev.check(.build_exe_command);
+             return buildOutputType(gpa, arena, io, args, .{ .build = .Exe }, environ_map);
+@@ -434,7 +467,7 @@ fn mainArgs(
+             });
+             defer dirs.deinit(io);
+             const host = std.zig.resolveTargetQueryOrFatal(io, .{});
+-            var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
++            var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
+             try @import("print_targets.zig").cmdTargets(
+                 arena,
+                 io,
+@@ -468,7 +501,7 @@ fn mainArgs(
+             });
+             defer dirs.deinit(io);
+             const host = std.zig.resolveTargetQueryOrFatal(io, .{});
+-            var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
++            var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
+             try @import("print_env.zig").cmdEnv(
+                 arena,
+                 &stdout_writer.interface,
